@@ -61,3 +61,28 @@ def encode(algo, k, m, data):
         raise Exception("EC encode failure")
     finally:
         _lib.ecp_job_close(job)
+
+
+class ECDriver(object):
+    """Mimic the pyeclib driver interface"""
+
+    def __init__(self, k=1, m=1, ec_type=None):
+        self.k = k
+        self.m = m
+        self.algo = ec_type
+
+    def min_parity_fragments_needed(self):
+        return 0
+
+    def get_segment_info(self, size, _ignored):
+        # return {"fragment_size": 0}
+        raise Exception("NYI")
+
+    def encode(self, data):
+        return encode(self.algo, k, m, data)
+
+    def decode(self, fragments):
+        raise Exception("NYI")
+
+    def reconstruct(self, fragments, missing):
+        raise Exception("NYI")
