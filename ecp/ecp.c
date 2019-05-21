@@ -21,6 +21,7 @@ License along with this library.
 
 #include <glib.h>
 #include <liberasurecode/erasurecode.h>
+#include <python2.7/Python.h>
 
 #include "ecp.h"
 
@@ -57,14 +58,15 @@ struct ecp_job_s {
 	struct iovec original;
 	struct iovec encoded[24];
 
-	enum ecp_action_e action;
-
-	int encode_or_decode;
 	int algo;
 	int k;
 	int m;
 	int status;
+
 	int fd_wakeup;
+
+	guint64 fragment_size;
+	enum ecp_action_e action;
 };
 
 static struct ecp_ctx_s ecp_ctx = {};
@@ -144,24 +146,23 @@ static int _get_instance(struct ecp_job_s *job, struct ecp_ctx_s *ctx) {
 
 static void _action_encode(struct ecp_job_s *job, struct ecp_ctx_s *ctx) {
 	char **data = NULL, **parity = NULL;
-	uint64_t fragment_size = 0;
 	int instance = _get_instance(job, ctx);
 
 	int rc = liberasurecode_encode(instance,
 			job->original.iov_base, job->original.iov_len,
-			&data, &parity, &fragment_size);
+			&data, &parity, &job->fragment_size);
 	job->status = rc;
 
 	if (rc == 0) {
 		int i = 0;
 		for (int j=0; j<job->k ;j++,i++) {
 			job->encoded[i].iov_base = data[j];
-			job->encoded[i].iov_len = fragment_size;
+			job->encoded[i].iov_len = job->fragment_size;
 			data[j] = NULL;
 		}
 		for (int j=0; j<job->m ;j++,i++) {
 			job->encoded[i].iov_base = parity[j];
-			job->encoded[i].iov_len = fragment_size;
+			job->encoded[i].iov_len = job->fragment_size;
 			parity[j] = NULL;
 		}
 		rc = liberasurecode_encode_cleanup(instance, data, parity);
@@ -285,4 +286,17 @@ void ecp_job_set_original(struct ecp_job_s *job, void *base, int len) {
 	g_assert_nonnull(job);
 	job->original.iov_base = base;
 	job->original.iov_len = len;
+}
+
+PyObject* ecp_job_get_fragments(struct ecp_job_s *job) {
+	g_assert_nonnull(job);
+	g_assert_cmpint(job->action, ==, THP_ENCODE);
+	const int max = job->k + job->m;
+	PyObject *out = PyTuple_New(max);
+	for (int i=0; i<max ;i++) {
+		PyObject *buf = PyBuffer_FromMemory(
+				job->encoded[i].iov_base, job->encoded[i].iov_len);
+		PyTuple_SetItem(out, i, buf);
+	}
+	return out;
 }

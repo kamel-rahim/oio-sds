@@ -40,6 +40,8 @@ struct ecp_job_s * ecp_job_init(int algo, int k, int m);
 
 void ecp_job_set_original(struct ecp_job_s *job, void *base, int len);
 
+PyObject* ecp_job_get_fragments(struct ecp_job_s *job);
+
 /* Return a file descriptor you just have to read on to wait for the
  * job's completion. */
 int ecp_job_fd(struct ecp_job_s *job);
