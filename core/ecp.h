@@ -25,10 +25,20 @@ License along with this library.
 #ifndef OIO_SDS__core__oioecp_h
 # define OIO_SDS__core__oioecp_h 1
 
+extern const int algo_JERASURE_RS_VAND;
+extern const int algo_JERASURE_RS_CAUCHY;
+extern const int algo_ISA_L_RS_VAND;
+extern const int algo_ISA_L_RS_CAUCHY;
+extern const int algo_SHSS;
+extern const int algo_LIBERASURECODE_RS_VAND;
+extern const int algo_LIBPHAZR;
+
 struct ecp_job_s;
 
 /* Allocate and prepare a job structure */
 struct ecp_job_s * ecp_job_init(int algo, int k, int m);
+
+void ecp_job_set_original(struct ecp_job_s *job, void *base, int len);
 
 /* Return a file descriptor you just have to read on to wait for the
  * job's completion. */
