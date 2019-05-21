@@ -51,7 +51,7 @@ add_custom_command(
 		"lb"
 		${CMAKE_SOURCE_DIR}/conf.json)
 
-add_library(oiocore SHARED url.c cfg.c str.c ext.c log.c loc.c lb.c var.c
+add_library(oiocore SHARED url.c cfg.c str.c ext.c log.c loc.c lb.c var.c ecp.c
 	${CMAKE_CURRENT_BINARY_DIR}/client_variables.h
 	${CMAKE_CURRENT_BINARY_DIR}/client_variables.c
 	${CMAKE_CURRENT_BINARY_DIR}/lb_variables.h
@@ -59,7 +59,8 @@ add_library(oiocore SHARED url.c cfg.c str.c ext.c log.c loc.c lb.c var.c
 
 set_target_properties(oiocore PROPERTIES PUBLIC_HEADER "oio_core.h" VERSION 0.0.0 SOVERSION 0)
 target_link_libraries(oiocore
-		${JSONC_LIBRARIES} ${GLIB2_LIBRARIES})
+		${JSONC_LIBRARIES} ${GLIB2_LIBRARIES}
+		-lerasurecode)
 
 add_library(oiosds SHARED
 	http_put.c
