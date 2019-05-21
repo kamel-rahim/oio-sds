@@ -13,6 +13,7 @@
 # You should have received a copy of the GNU Lesser General Public
 # License along with this library.
 
+import errno
 from os import read
 from ctypes import CDLL, c_int, c_void_p, py_object
 
@@ -43,8 +44,54 @@ algo_JERASURE_RS_CAUCHY = c_int.in_dll(_lib, "algo_JERASURE_RS_CAUCHY")
 algo_ISA_L_RS_VAND = c_int.in_dll(_lib, "algo_ISA_L_RS_VAND")
 algo_ISA_L_RS_CAUCHY = c_int.in_dll(_lib, "algo_ISA_L_RS_CAUCHY")
 algo_SHSS = c_int.in_dll(_lib, "algo_SHSS")
-algo_LIBPHAZR = c_int.in_dll(_lib, "algo_LIBPHAZR")
+# I removed algo_LIBPHAZR because it could'nt be found
+# I use a ubuntu 16.04
 
+def concurrent_encode(algo, k, m, data, verbose=False):
+    """
+    Apply the given EC algorithm and return the fragments.
+    But do not block the current thread doing it
+    """
+    import eventlet
+
+    job = _lib.ecp_job_init(algo, k, m)
+    _lib.ecp_job_set_original(job, data, len(data))
+    try:
+        _lib.ecp_job_encode(job)
+        fd = _lib.ecp_job_fd(job)
+        if verbose:
+            print "We start waiting"
+        done = False
+        a = 0
+        while not done:
+            # Weird case the first loop Failed with a EAGAIN
+            # that should be caught but the second time it waits normally
+            # no busy waiting
+            print "number of loop %i" % a
+            a += 1
+            try:
+                # here the fd should be open on NONBLOCK
+                # EFD_NONBLOCK for eventfd
+                # A sleep() was add on C code to slow down the process
+                eventlet.os.read(fd, 8)
+                done = True
+            except OSError as e:
+                # This is weird because eventlet.os.read
+                # should catch EAGAIN
+                if e.errno == errno.EAGAIN:
+                    # This force the switch to another coroutine
+                    # and create a listener on fd
+                    eventlet.hubs.trampoline(fd, read=True)
+                else:
+                    raise
+
+        if verbose:
+            print "End of wait"
+        if 0 == _lib.ecp_job_status(job):
+            return _lib.ecp_job_get_fragments(job)
+        raise Exception("EC encode failure")
+    finally:
+        _lib.ecp_job_close(job)
 
 def encode(algo, k, m, data):
     """

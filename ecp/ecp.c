@@ -18,7 +18,7 @@ License along with this library.
 
 #include <sys/uio.h>
 #include <sys/eventfd.h>
-
+#include <sys/unistd.h>
 #include <glib.h>
 #include <liberasurecode/erasurecode.h>
 #include <python2.7/Python.h>
@@ -33,7 +33,6 @@ const int algo_ISA_L_RS_VAND = EC_BACKEND_ISA_L_RS_VAND;
 const int algo_ISA_L_RS_CAUCHY = EC_BACKEND_ISA_L_RS_CAUCHY;
 const int algo_SHSS = EC_BACKEND_SHSS;
 const int algo_LIBERASURECODE_RS_VAND = EC_BACKEND_LIBERASURECODE_RS_VAND;
-const int algo_LIBPHAZR = EC_BACKEND_LIBPHAZR;
 
 struct ec_handle_s {
 	ec_backend_id_t backend;
@@ -147,7 +146,7 @@ static int _get_instance(struct ecp_job_s *job, struct ecp_ctx_s *ctx) {
 static void _action_encode(struct ecp_job_s *job, struct ecp_ctx_s *ctx) {
 	char **data = NULL, **parity = NULL;
 	int instance = _get_instance(job, ctx);
-
+	sleep(5);
 	int rc = liberasurecode_encode(instance,
 			job->original.iov_base, job->original.iov_len,
 			&data, &parity, &job->fragment_size);
@@ -202,7 +201,6 @@ static gboolean _job_check(struct ecp_job_s *job) {
 		case EC_BACKEND_SHSS:
 		case EC_BACKEND_LIBERASURECODE_RS_VAND:
 		case EC_BACKEND_ISA_L_RS_CAUCHY:
-		case EC_BACKEND_LIBPHAZR:
 			break;
 		default:
 			return FALSE;
@@ -234,7 +232,7 @@ struct ecp_job_s * ecp_job_init(int algo, int k, int m) {
 	h->k = k;
 	h->m = m;
 	h->status = -1;
-	h->fd_wakeup = eventfd(0, EFD_SEMAPHORE);
+	h->fd_wakeup = eventfd(0, EFD_SEMAPHORE | EFD_NONBLOCK);
 	return h;
 }
 
