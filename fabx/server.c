@@ -49,6 +49,83 @@ static struct fid_pep *passive_endpoint = NULL;
 
 /* ------------------------------------------------------------------------- */
 
+enum fabx_request_type_e {
+	FABX_REQ_PUT = 1,
+	FABX_REQ_DEL = 2,
+	FABX_REQ_GET = 3,
+	FABX_REQ_HEAD = 4,
+};
+
+struct fabx_request_header_PUT_s {
+	char chunk_id[STRLEN_CHUNKID];
+	char content_id[STRLEN_CONTAINERID];
+	char content_version[LIMIT_LENGTH_VERSION];
+	char ns_name[LIMIT_LENGTH_NSNAME];
+	char account_name[LIMIT_LENGTH_ACCOUNTNAME];
+	char user_name[LIMIT_LENGTH_USER];
+	char content_path[LIMIT_LENGTH_CONTENTPATH];
+} __attribute__((packed));
+
+struct fabx_request_header_GET_s {
+	char chunk_id[STRLEN_CHUNKID];
+} __attribute__((packed));
+
+struct fabx_request_header_DEL_s {
+	char chunk_id[STRLEN_CHUNKID];
+} __attribute__((packed));
+
+union fabx_request_choice_u {
+	struct fabx_request_header_PUT_s put;
+	struct fabx_request_header_DEL_s del;
+	struct fabx_request_header_GET_s get;
+} __attribute__((packed));
+
+struct fabx_request_header_s {
+	enum fabx_request_type_e type : 32;
+	guint8 request_id[LIMIT_LENGTH_REQID];
+	char auth_token[256];
+	union fabx_request_choice_u actual;
+} __attribute__((packed));
+
+/* ------------------------------------------------------------------------- */
+
+enum fabx_reply_type_e {
+	FABX_REP_PUT = 1,
+	FABX_REP_DEL = 2,
+	FABX_REP_GET = 3,
+};
+
+struct fabx_reply_header_PUT_s {
+	guint32 status;
+} __attribute__((packed));
+
+struct fabx_reply_header_DEL_s {
+	guint32 status;
+} __attribute__((packed));
+
+struct fabx_reply_header_GET_s {
+	guint32 status;
+	char content_id[STRLEN_CONTAINERID];
+	char content_version[LIMIT_LENGTH_VERSION];
+	char account_name[LIMIT_LENGTH_USER];
+	char user_name[LIMIT_LENGTH_USER];
+	char content_path[LIMIT_LENGTH_CONTENTPATH];
+} __attribute__((packed));
+
+
+union fabx_reply_choice_u {
+	struct fabx_reply_header_PUT_s put;
+	struct fabx_reply_header_DEL_s del;
+	struct fabx_reply_header_GET_s get;
+} __attribute__((packed));
+
+struct fabx_reply_header_s {
+	enum fabx_reply_type_e type : 32;
+	union fabx_reply_choice_u actual;
+} __attribute__((packed));
+
+/* ------------------------------------------------------------------------- */
+
 struct active_cnx_context_s
 {
 	struct fid_ep *endpoint;
@@ -58,39 +135,84 @@ struct active_cnx_context_s
 	struct fid_eq *eq;
 };
 
-static guint8 *_base(guint8 *s) { return s + sizeof(long) - ((unsigned long)s % sizeof(long)); }
+static guint8 *
+_base(guint8 *s)
+{
+	return s + sizeof(long) - ((unsigned long)s % sizeof(long));
+}
+
+static int
+_manage_put(struct active_cnx_context_s *ctx,
+			const struct fabx_request_header_PUT_s *hdr)
+{
+	(void) ctx, (void) hdr;
+	return -1;
+}
+
+static int
+_manage_del(struct active_cnx_context_s *ctx,
+			const struct fabx_request_header_DEL_s *hdr)
+{
+	(void) ctx, (void) hdr;
+	return -1;
+}
+
+static int
+_manage_get(struct active_cnx_context_s *ctx,
+			const struct fabx_request_header_GET_s *hdr,
+			gboolean body)
+{
+	(void) ctx, (void) hdr, (void) body;
+	return -1;
+}
 
 static void
-_worker(gpointer data, gpointer context UNUSED)
-{
+_worker(gpointer data, gpointer context UNUSED) {
 	struct active_cnx_context_s *ctx = data;
 	g_assert(ctx != NULL);
 
 	ssize_t sz;
 	fi_addr_t src_addr = {0};
 
-	guint8 blob[(1024*1024)+sizeof(long)];
-
-	/* Ensure a buffer well aligned */
+	const gsize length = sizeof(struct fabx_reply_header_s);
+	const gsize real_length = length + sizeof(long);
+	guint8 *blob = g_malloc(real_length);
 	guint8 *base = _base(blob);
-	size_t length = 1024 * 1024;
 
-	g_strlcpy((char*)base, "plop", length);
+	/* Post a read order for the header, and wait for the completion */
+	sz = fi_recv(ctx->endpoint, base, length, NULL, src_addr, ctx);
+	g_assert(sz == 0);
+	struct fi_cq_entry cq_entry = {NULL};
+	sz = fi_cq_sread(ctx->cq_rx, &cq_entry, 1, NULL, -1);
+	g_assert(sz == 1);
 
-	for (;;) {
-		/* Post a read order */
-		sz = fi_recv(ctx->endpoint, base, length, NULL, src_addr, ctx);
-		GRID_WARN("fi_recv rc %ld", sz);
-		g_assert(sz == 0);
-
-		/* Wait for the completion of the read command */
-		struct fi_cq_entry cq_entry = {NULL};
-		sz = fi_cq_sread(ctx->cq_rx, &cq_entry, 1, NULL, -1);
-		GRID_WARN("fi_cq_sread rc %ld", sz);
-		g_assert(sz == 1);
-
-		GRID_WARN("> %.*s", 4, (char *) base);
+	int rc = 0;
+	const struct fabx_request_header_s *hdr = (struct fabx_request_header_s *) base;
+	switch (hdr->type) {
+		case FABX_REQ_PUT:
+			rc = _manage_put(ctx, &hdr->actual.put);
+			break;
+		case FABX_REQ_DEL:
+			rc = _manage_del(ctx, &hdr->actual.del);
+			break;
+		case FABX_REQ_GET:
+			rc = _manage_get(ctx, &hdr->actual.get, TRUE);
+			break;
+		case FABX_REQ_HEAD:
+			rc = _manage_get(ctx, &hdr->actual.get, FALSE);
+			break;
 	}
+
+	g_free(blob);
+
+	if (!rc)
+		GRID_WARN("Request error");
+
+	rc = fi_shutdown(ctx->endpoint, FI_RECV|FI_SEND);
+	g_assert(rc == 0);
+
+	rc = fi_close(&ctx->endpoint->fid);
+	g_assert(rc == 0);
 }
 
 static int
