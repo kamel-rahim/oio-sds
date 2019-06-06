@@ -16,8 +16,10 @@ You should have received a copy of the GNU Affero General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#include <glib.h>
+#include <fcntl.h>
+#include <unistd.h>
 
+#include <glib.h>
 #include <rdma/fabric.h>
 #include <rdma/fi_rma.h>
 #include <rdma/fi_errno.h>
@@ -29,11 +31,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <core/oio_core.h>
 #include <metautils/lib/metautils.h>
 
+#include "protocol.h"
+
 static gboolean config_system = TRUE;
 static GSList *config_paths = NULL;
 static gchar config_host[256];
 static gchar config_port[32];
 static gchar config_ns[LIMIT_LENGTH_NSNAME];
+static gchar config_basedir[1024];
 
 static GThreadPool *pool_workers = NULL;
 
@@ -49,83 +54,6 @@ static struct fid_pep *passive_endpoint = NULL;
 
 /* ------------------------------------------------------------------------- */
 
-enum fabx_request_type_e {
-	FABX_REQ_PUT = 1,
-	FABX_REQ_DEL = 2,
-	FABX_REQ_GET = 3,
-	FABX_REQ_HEAD = 4,
-};
-
-struct fabx_request_header_PUT_s {
-	char chunk_id[STRLEN_CHUNKID];
-	char content_id[STRLEN_CONTAINERID];
-	char content_version[LIMIT_LENGTH_VERSION];
-	char ns_name[LIMIT_LENGTH_NSNAME];
-	char account_name[LIMIT_LENGTH_ACCOUNTNAME];
-	char user_name[LIMIT_LENGTH_USER];
-	char content_path[LIMIT_LENGTH_CONTENTPATH];
-} __attribute__((packed));
-
-struct fabx_request_header_GET_s {
-	char chunk_id[STRLEN_CHUNKID];
-} __attribute__((packed));
-
-struct fabx_request_header_DEL_s {
-	char chunk_id[STRLEN_CHUNKID];
-} __attribute__((packed));
-
-union fabx_request_choice_u {
-	struct fabx_request_header_PUT_s put;
-	struct fabx_request_header_DEL_s del;
-	struct fabx_request_header_GET_s get;
-} __attribute__((packed));
-
-struct fabx_request_header_s {
-	enum fabx_request_type_e type : 32;
-	guint8 request_id[LIMIT_LENGTH_REQID];
-	char auth_token[256];
-	union fabx_request_choice_u actual;
-} __attribute__((packed));
-
-/* ------------------------------------------------------------------------- */
-
-enum fabx_reply_type_e {
-	FABX_REP_PUT = 1,
-	FABX_REP_DEL = 2,
-	FABX_REP_GET = 3,
-};
-
-struct fabx_reply_header_PUT_s {
-	guint32 status;
-} __attribute__((packed));
-
-struct fabx_reply_header_DEL_s {
-	guint32 status;
-} __attribute__((packed));
-
-struct fabx_reply_header_GET_s {
-	guint32 status;
-	char content_id[STRLEN_CONTAINERID];
-	char content_version[LIMIT_LENGTH_VERSION];
-	char account_name[LIMIT_LENGTH_USER];
-	char user_name[LIMIT_LENGTH_USER];
-	char content_path[LIMIT_LENGTH_CONTENTPATH];
-} __attribute__((packed));
-
-
-union fabx_reply_choice_u {
-	struct fabx_reply_header_PUT_s put;
-	struct fabx_reply_header_DEL_s del;
-	struct fabx_reply_header_GET_s get;
-} __attribute__((packed));
-
-struct fabx_reply_header_s {
-	enum fabx_reply_type_e type : 32;
-	union fabx_reply_choice_u actual;
-} __attribute__((packed));
-
-/* ------------------------------------------------------------------------- */
-
 struct active_cnx_context_s
 {
 	struct fid_ep *endpoint;
@@ -135,17 +63,116 @@ struct active_cnx_context_s
 	struct fid_eq *eq;
 };
 
+/**
+ * Return a pointer to a region aligned on a "long", just after the region
+ * pointed by the given `s` pointer.
+ * @param s
+ * @return
+ */
 static guint8 *
-_base(guint8 *s)
+_base(register guint8 *s)
 {
 	return s + sizeof(long) - ((unsigned long)s % sizeof(long));
 }
 
+static gboolean
+_prepare_path(const char *chunk_id, GString **path_final, GString **path_temp)
+{
+	// TODO(jfs): ensure the chunkid is hexa
+
+	*path_final = g_string_new(config_basedir);
+	g_string_append_c(*path_final, G_DIR_SEPARATOR);
+	// TODO(jfs): use a hashed directory
+	g_string_append(*path_final, chunk_id);
+
+	*path_temp = g_string_new((*path_final)->str);
+	g_string_append_static(*path_temp, ".pending");
+
+	return TRUE;
+}
+
 static int
 _manage_put(struct active_cnx_context_s *ctx,
-			const struct fabx_request_header_PUT_s *hdr)
+			const struct fabx_request_header_PUT_s *hdr,
+			guint8 **blob, gsize length)
 {
-	(void) ctx, (void) hdr;
+	struct fi_cq_entry cq_entry = {NULL};
+	ssize_t sz;
+
+	GString *path, *path_temp;
+	gboolean commit = _prepare_path(hdr->chunk_id, &path, &path_temp);
+
+	int fd = metautils_syscall_open(path_temp->str, 0644, O_CREAT|O_EXCL|O_WRONLY);
+	if (fd > 0) {
+		/* Ensure a sufficient buffer to work with */
+		if (hdr->block_size + sizeof(long) > length)
+			*blob = g_realloc(*blob, hdr->block_size + sizeof(long));
+		length = hdr->block_size + sizeof(long);
+		guint8 *base = _base(*blob);
+
+		for (gboolean running = TRUE; running ;) {
+			fi_addr_t src_addr = {0};
+
+			/* read a chunk of data */
+			sz = fi_recv(ctx->endpoint, base, length, NULL, src_addr, ctx);
+			g_assert(sz == 0);
+			sz = fi_cq_sread(ctx->cq_rx, &cq_entry, 1, NULL, -1);
+			g_assert(sz == 1);
+
+			/* An empty chunk mark the end of the sequence */
+			const guint32 chunk_size = g_ntohl(*((guint32*)base));
+			if (0 == chunk_size) {
+				GRID_TRACE("Final block detected");
+				break;
+			}
+
+			/* A chunk announced longer than the block is illegal */
+			if (chunk_size + 4 > length) {
+				GRID_WARN("Chunk (%u) too large (max %lu - 4)", chunk_size, length);
+				commit = FALSE;
+				running = FALSE;
+				break;
+			}
+
+			/* Append the block to the file */
+			for (guint32 total = 0; total < chunk_size ;) {
+				sz = write(fd, base + 4 + total, chunk_size - total);
+				if (sz < 0) {
+					commit = FALSE;
+					running = FALSE;
+					break;
+				} else {
+					total += sz;
+				}
+			}
+		}
+
+		/* Validate the blob on the persistent media */
+		if (commit) {
+			rename(path_temp->str, path->str);
+		} else {
+			unlink(path_temp->str);
+		}
+		metautils_pclose(&fd);
+
+		/* Reply to the client and wait for the completion */
+		memset(base, 0, sizeof(struct fabx_reply_header_s));
+		struct fabx_reply_header_s *reply = (struct fabx_reply_header_s*) base;
+		reply->version = g_htons(1);
+		reply->type = g_htons(FABX_REP_PUT);
+		reply->actual.put.status = g_htonl(commit ? 201 : 500);
+		sz = fi_send(ctx->endpoint,
+				base, sizeof(struct fabx_reply_header_s),
+				NULL,  /* descriptor */
+				0,     /* destination address */
+				NULL   /* context */);
+		g_assert(sz == 0);
+		sz = fi_cq_sread(ctx->cq_tx, &cq_entry, 1, NULL, -1);
+		g_assert(sz == 1);
+	}
+
+	g_string_free(path, TRUE);
+	g_string_free(path_temp, TRUE);
 	return -1;
 }
 
@@ -187,10 +214,12 @@ _worker(gpointer data, gpointer context UNUSED) {
 	g_assert(sz == 1);
 
 	int rc = 0;
-	const struct fabx_request_header_s *hdr = (struct fabx_request_header_s *) base;
+	struct fabx_request_header_s *hdr = (struct fabx_request_header_s *) base;
+	hdr->type = g_ntohl(hdr->type);
 	switch (hdr->type) {
 		case FABX_REQ_PUT:
-			rc = _manage_put(ctx, &hdr->actual.put);
+			hdr->actual.put.block_size = g_ntohl(hdr->actual.put.block_size);
+			rc = _manage_put(ctx, &hdr->actual.put, &blob, length);
 			break;
 		case FABX_REQ_DEL:
 			rc = _manage_del(ctx, &hdr->actual.del);
@@ -471,8 +500,11 @@ static struct grid_main_callbacks main_callbacks =
 	.specific_stop = _specific_stop,
 };
 
+#define dump_size(S) g_printerr("sizeof(" #S ") = %ld\n", sizeof(S))
 int
 main (int argc, char **argv)
 {
+	dump_size(struct fabx_request_header_s);
+	dump_size(struct fabx_reply_header_s);
 	return grid_main (argc, argv, &main_callbacks);
 }
