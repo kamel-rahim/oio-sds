@@ -32,6 +32,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <metautils/lib/metautils.h>
 
 #include "protocol.h"
+#include "utils.h"
 
 static gboolean config_system = TRUE;
 static GSList *config_paths = NULL;
@@ -200,25 +201,85 @@ _manage_put(struct active_cnx_context_s *ctx,
 
 static int
 _manage_del(struct active_cnx_context_s *ctx,
-			const struct fabx_request_header_DEL_s *hdr,
-			guint8 **blob, gsize *length)
+			const struct fabx_request_header_DEL_s *hdr)
 {
 	(void) ctx;
 	GString *path = NULL;
 	if (!_prepare_path(hdr->chunk_id, &path, NULL)) {
-		_reply_error(ctx, blob, length, 400);
+		_reply_error(ctx, NULL, 0, 400);
 		return -1;
 	}
+	int rc = unlink(path->str);
+	// No check necessary unlink will return a error on not found
+	if (rc) {
+		if (errno == ENOENT)
+			_reply_error(ctx, NULL, 0, 404);
+		else
+			_reply_error(ctx, NULL, 0, 500);
+	} else {
+		_reply_error(ctx, NULL, 0, 204);
+	}
 
+	g_string_free(path, TRUE);
 	return -1;
 }
 
+static int
+_manage_get_body(struct active_cnx_context_s *ctx, int fd) {
+	gsize length = 65536;
+	guint8 *base = g_malloc(length);
+	ssize_t sz;
+	for (gboolean running = TRUE; running;){
+		sz = read(fd, base + 4, length - 4);
+		guint32 chunk_size = 0;
+		if (sz > 0)
+			chunk_size = g_htonl(sz - 4);
+		else if (!sz)
+			running = FALSE;
+		else
+			break;
+
+		memcpy(base, &chunk_size, 4);
+		sz = fi_send(ctx->endpoint, base, sz + 4, NULL, 0, NULL);
+	}
+	g_free(base);
+	return -1;
+}
 static int
 _manage_get(struct active_cnx_context_s *ctx,
 			const struct fabx_request_header_GET_s *hdr,
 			gboolean body)
 {
-	(void) ctx, (void) hdr, (void) body;
+	(void) ctx, (void) hdr;
+
+	GString *path = NULL;
+	if (!_prepare_path(hdr->chunk_id, &path, NULL)) {
+		_reply_error(ctx, NULL, 0, 400);
+		return -1;
+	}
+
+	int fd = open(path->str, O_RDONLY);
+	if (fd > 0) {
+	  /* This code do not work since I have to create a new reply_get
+	     to use reply_header_GET_s*/
+		/* GET(ATTR_NAME_CONTENT_CONTAINER, hdr->actual.user_name); */
+		/* GET(ATTR_NAME_CONTENT_PATH,      hdr->actual.content_path); */
+		/* GET(ATTR_NAME_CONTENT_VERSION,   hdr->content_version); */
+		/* GET(ATTR_NAME_CONTENT_ID,        hdr->content_id); */
+		/* GET(ATTR_NAME_,        hdr->content_id); */
+		/* _reply_error(ctx, NULL, 0, 201); */
+		if (body)
+			_manage_get_body(ctx, fd);
+
+	} else {
+		if (errno == ENOENT)
+			_reply_error(ctx, NULL, 0, 404);
+		else
+			_reply_error(ctx, NULL, 0, 500);
+	}
+
+	g_string_free(path, TRUE);
+	metautils_pclose(&fd);
 	return -1;
 }
 
@@ -230,7 +291,7 @@ _worker(gpointer data, gpointer context UNUSED) {
 	ssize_t sz;
 	fi_addr_t src_addr = {0};
 
-	const gsize length = sizeof(struct fabx_reply_header_s);
+	gsize length = sizeof(struct fabx_reply_header_s);
 	const gsize real_length = length + sizeof(long);
 	guint8 *blob = g_malloc(real_length);
 	guint8 *base = _base(blob);
@@ -245,10 +306,11 @@ _worker(gpointer data, gpointer context UNUSED) {
 	int rc = 0;
 	struct fabx_request_header_s *hdr = (struct fabx_request_header_s *) base;
 	hdr->type = g_ntohl(hdr->type);
+
 	switch (hdr->type) {
 		case FABX_REQ_PUT:
 			hdr->actual.put.block_size = g_ntohl(hdr->actual.put.block_size);
-			rc = _manage_put(ctx, &hdr->actual.put, &blob, length);
+			rc = _manage_put(ctx, &hdr->actual.put, &blob, &length);
 			break;
 		case FABX_REQ_DEL:
 			rc = _manage_del(ctx, &hdr->actual.del);
