@@ -79,43 +79,77 @@ static gboolean
 _prepare_path(const char *chunk_id, GString **path_final, GString **path_temp)
 {
 	// TODO(jfs): ensure the chunkid is hexa
-
-	*path_final = g_string_new(config_basedir);
-	g_string_append_c(*path_final, G_DIR_SEPARATOR);
-	// TODO(jfs): use a hashed directory
-	g_string_append(*path_final, chunk_id);
-
-	*path_temp = g_string_new((*path_final)->str);
-	g_string_append_static(*path_temp, ".pending");
-
+	if (path_final) {
+		*path_final = g_string_new(config_basedir);
+		g_string_append_c(*path_final, G_DIR_SEPARATOR);
+		// TODO(jfs): use a hashed directory
+		g_string_append(*path_final, chunk_id);
+		if (path_temp) {
+			*path_temp = g_string_new((*path_final)->str);
+			g_string_append_static(*path_temp, ".pending");
+		}
+	}
 	return TRUE;
+}
+
+static void
+_reply_error(struct active_cnx_context_s *ctx,
+			 guint8 **blob, gsize *length,
+			 int code)
+{
+	/* ensure the working buffer is large enough */
+	if (sizeof(struct fabx_reply_header_s) + sizeof(long) > *length) {
+		*length = sizeof(struct fabx_reply_header_s) + sizeof(long);
+		*blob = g_realloc(*blob, *length);
+	}
+
+	guint8 *base = _base(*blob);
+	memset(base, 0, sizeof(struct fabx_reply_header_s));
+
+	struct fabx_reply_header_s *reply = (struct fabx_reply_header_s*) base;
+	reply->version = g_htons(1);
+	reply->type = g_htons(FABX_REP_PUT);
+	reply->actual.put.status = g_htonl(code);
+	ssize_t sz = fi_send(ctx->endpoint,
+						 base, sizeof(struct fabx_reply_header_s),
+						 NULL,  /* descriptor */
+				         0,     /* destination address */
+				         NULL   /* context */);
+	g_assert(sz == 0);
+	struct fi_cq_entry cq_entry = {NULL};
+	sz = fi_cq_sread(ctx->cq_tx, &cq_entry, 1, NULL, -1);
+	g_assert(sz == 1);
 }
 
 static int
 _manage_put(struct active_cnx_context_s *ctx,
 			const struct fabx_request_header_PUT_s *hdr,
-			guint8 **blob, gsize length)
+			guint8 **blob, gsize *length)
 {
-	struct fi_cq_entry cq_entry = {NULL};
-	ssize_t sz;
+	GString *path = NULL, *path_temp = NULL;
+	if (!_prepare_path(hdr->chunk_id, &path, &path_temp)) {
+		_reply_error(ctx, blob, length, 400);
+		return -1;
+	}
 
-	GString *path, *path_temp;
-	gboolean commit = _prepare_path(hdr->chunk_id, &path, &path_temp);
+	/* Ensure a sufficient buffer to work with */
+	if (hdr->block_size + sizeof(long) > *length) {
+		*length = hdr->block_size + sizeof(long);
+		*blob = g_realloc(*blob, *length);
+	}
+	guint8 *base = _base(*blob);
+	ssize_t sz;
 
 	int fd = metautils_syscall_open(path_temp->str, 0644, O_CREAT|O_EXCL|O_WRONLY);
 	if (fd > 0) {
-		/* Ensure a sufficient buffer to work with */
-		if (hdr->block_size + sizeof(long) > length)
-			*blob = g_realloc(*blob, hdr->block_size + sizeof(long));
-		length = hdr->block_size + sizeof(long);
-		guint8 *base = _base(*blob);
-
+		gboolean commit = TRUE;
 		for (gboolean running = TRUE; running ;) {
 			fi_addr_t src_addr = {0};
 
 			/* read a chunk of data */
-			sz = fi_recv(ctx->endpoint, base, length, NULL, src_addr, ctx);
+			sz = fi_recv(ctx->endpoint, base, *length, NULL, src_addr, ctx);
 			g_assert(sz == 0);
+			struct fi_cq_entry cq_entry = {NULL};
 			sz = fi_cq_sread(ctx->cq_rx, &cq_entry, 1, NULL, -1);
 			g_assert(sz == 1);
 
@@ -127,8 +161,8 @@ _manage_put(struct active_cnx_context_s *ctx,
 			}
 
 			/* A chunk announced longer than the block is illegal */
-			if (chunk_size + 4 > length) {
-				GRID_WARN("Chunk (%u) too large (max %lu - 4)", chunk_size, length);
+			if (chunk_size + 4 > *length) {
+				GRID_WARN("Chunk (%u) too large (max %lu - 4)", chunk_size, *length);
 				commit = FALSE;
 				running = FALSE;
 				break;
@@ -155,20 +189,8 @@ _manage_put(struct active_cnx_context_s *ctx,
 		}
 		metautils_pclose(&fd);
 
-		/* Reply to the client and wait for the completion */
-		memset(base, 0, sizeof(struct fabx_reply_header_s));
-		struct fabx_reply_header_s *reply = (struct fabx_reply_header_s*) base;
-		reply->version = g_htons(1);
-		reply->type = g_htons(FABX_REP_PUT);
-		reply->actual.put.status = g_htonl(commit ? 201 : 500);
-		sz = fi_send(ctx->endpoint,
-				base, sizeof(struct fabx_reply_header_s),
-				NULL,  /* descriptor */
-				0,     /* destination address */
-				NULL   /* context */);
-		g_assert(sz == 0);
-		sz = fi_cq_sread(ctx->cq_tx, &cq_entry, 1, NULL, -1);
-		g_assert(sz == 1);
+		/* Emit the reply to the client */
+		_reply_error(ctx, blob, length, commit ? 201 : 500);
 	}
 
 	g_string_free(path, TRUE);
@@ -178,9 +200,16 @@ _manage_put(struct active_cnx_context_s *ctx,
 
 static int
 _manage_del(struct active_cnx_context_s *ctx,
-			const struct fabx_request_header_DEL_s *hdr)
+			const struct fabx_request_header_DEL_s *hdr,
+			guint8 **blob, gsize *length)
 {
-	(void) ctx, (void) hdr;
+	(void) ctx;
+	GString *path = NULL;
+	if (!_prepare_path(hdr->chunk_id, &path, NULL)) {
+		_reply_error(ctx, blob, length, 400);
+		return -1;
+	}
+
 	return -1;
 }
 
